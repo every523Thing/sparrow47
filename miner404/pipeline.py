@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import io
 import json
+import math
 import random
 import re
 import time
@@ -299,6 +300,22 @@ class ModelCalls(Protocol):
     def create(self, *, request_id: int = 0, **params: Unpack[ResponseCreateParamsBase]) -> Response: ...
 
 
+def grid_of(tiles: list[bytes], options: RenderOptions) -> bytes:
+    """Single-view renders laid out as the renderer lays out a multi-view request (render-service-js render-pool.js):
+    ceil(sqrt(n)) columns, row by row, views at (col * (size + gap), row * (size + gap)) on a black canvas."""
+    count = len(tiles)
+    cols = math.ceil(math.sqrt(count))
+    rows = math.ceil(count / cols)
+    size, gap = options.img_size, options.gap
+    sheet = Image.new("RGBA", (cols * size + (cols - 1) * gap, rows * size + (rows - 1) * gap), (0, 0, 0, 255))
+    for index, tile in enumerate(tiles):
+        image = Image.open(io.BytesIO(tile)).convert("RGBA")
+        sheet.paste(image, ((index % cols) * (size + gap), (index // cols) * (size + gap)))
+    buffer = io.BytesIO()
+    sheet.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
 class PatientRenderer:
     def __init__(self, renderer: Renderer) -> None:
         self._renderer = renderer
@@ -328,9 +345,21 @@ class PatientRenderer:
         if key not in self.rendered and self.over(max(room, self.room)):
             self.refused += 1
             raise _render_capped()
-        image = self._patient(source, options)
+        image = self._tiled(source, options)
         self.rendered.add(key)
         return image
+
+    def _tiled(self, source: str, options: RenderOptions) -> bytes:
+        try:
+            return self._patient(source, options)
+        except RenderRejected as rejection:
+            if len(options.thetas) < 2 or "RENDER_TIMEOUT:" not in rejection.detail_json:
+                raise
+        # A heavy module can miss the deadline of a multi-view preview and still render each view in time: the same views,
+        # one request each (a single view that also misses its deadline is the rejection), laid out as the renderer does.
+        tiles = [self._patient(source, replace(options, thetas=(theta,), phis=(phi,)))
+                 for theta, phi in zip(options.thetas, options.phis, strict=True)]
+        return grid_of(tiles, options)
 
     def _patient(self, source: str, options: RenderOptions) -> bytes:
         waits = iter(RENDER_WAITS)
